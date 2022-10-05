@@ -1,5 +1,5 @@
 from pathlib import Path
-import os
+import os, time
 from sklearn.model_selection import train_test_split
 from transformers import DistilBertTokenizerFast
 import torch
@@ -10,6 +10,7 @@ from transformers import DistilBertForTokenClassification
 from pathlib import Path
 import re
 import numpy as np
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 
 #######################################
 '''
@@ -22,6 +23,19 @@ conda install -c anaconda scikit-learn
 #######################################
 
 PATH_WNUT17 = r'C:\ai\datasets\transformers\wnut17\wnut17train.conll'
+CACHE_DIR = r'C:\ai\datasets\huggingface'
+
+#   ToDo look at masking
+
+LR = 5e-5           # default 5e-5
+BATCH_SIZE = 16
+WARMUP_RATIO = 0.25
+GRADIENT_ACCUMULATION_STEPS = 4
+EPOCHS = 1
+WEIGHT_DECAY = 0.01
+
+########################################################################
+
 
 #######################################
 
@@ -51,6 +65,20 @@ class WNUTDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.labels)
+
+# for computing the metrics during training ToDo think of other useful metrics
+def compute_metrics(pred):
+    labels = pred.label_ids
+    rounded_labels = np.argmax(labels, axis=1)
+    preds = pred.predictions.argmax(-1)
+    precision, recall, f1, _ = precision_recall_fscore_support(rounded_labels, preds, average='weighted')
+    acc = accuracy_score(labels, preds)
+    return {
+        'accuracy': acc,
+        'f1': f1,
+        'precision': precision,
+        'recall': recall
+    }
 
 
 def encode_tags(tags, encodings):
@@ -87,6 +115,9 @@ def read_wnut(file_path):
 
     return token_docs, tag_docs
 
+DIR_OUTPUT_BASE = 'PATH_WNUT17_GRAD_ACC_STEPS_' +  str(GRADIENT_ACCUMULATION_STEPS) + '_LR_' + str(LR) + '_EPOCHS_' + str(EPOCHS) + '_' + str(time.time())
+DIR_OUTPUT = os.path.join(os.getcwd(), 'models', DIR_OUTPUT_BASE)      # saved metrics and data_dir
+
 #   define tokenizer
 tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -121,3 +152,55 @@ val_dataset = WNUTDataset(val_encodings, val_labels)
 #   create model
 model = DistilBertForTokenClassification.from_pretrained('distilbert-base-cased', num_labels=len(unique_tags))
 
+training_args = TrainingArguments(
+    output_dir=DIR_OUTPUT,
+    learning_rate=LR,
+    per_device_train_batch_size=BATCH_SIZE, #16
+    per_device_eval_batch_size=BATCH_SIZE * 4,  #16
+    num_train_epochs=EPOCHS,
+    warmup_ratio=WARMUP_RATIO,
+    weight_decay=WEIGHT_DECAY,
+    logging_steps=10,
+    evaluation_strategy='epoch',                #
+    save_strategy='epoch',                      # Needed to save best model in the end and to continue training from a checkpoint
+    bf16=True,
+    load_best_model_at_end=True,
+    #lr_scheduler_type=lr_scheduler_type,
+    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+    #lr_scheduler_type=
+    do_predict=True
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    tokenizer=tokenizer,
+    #data_collator=data_collator,
+    compute_metrics=compute_metrics
+)
+
+
+print("Finetune wnut")
+
+print(model.dtype)
+print(model.device)
+
+print('Start training')
+train_results = trainer.train()
+
+model.eval()
+
+trainer.save_model()
+trainer.log_metrics("train", train_results.metrics)
+trainer.save_metrics("train", train_results.metrics)
+trainer.save_state()
+
+#metrics = trainer.evaluate(eval_dataset=tokenized_imdb_test)
+metrics = trainer.evaluate(val_dataset)
+# some nice to haves:
+trainer.log_metrics("eval", metrics)
+trainer.save_metrics("eval", metrics)
+
+model.save_pretrained(r'models/' + 'wnut17_' + str(time.time()) + '.pth')
